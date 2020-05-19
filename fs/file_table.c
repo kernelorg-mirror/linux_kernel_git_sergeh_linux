@@ -52,7 +52,8 @@ static void file_free_rcu(struct rcu_head *head)
 
 static inline void file_free(struct file *f)
 {
-	percpu_counter_dec(&nr_files);
+	if (!(f->f_mode & FMODE_NOACCOUNT))
+		percpu_counter_dec(&nr_files);
 	call_rcu(&f->f_u.fu_rcuhead, file_free_rcu);
 }
 
@@ -91,6 +92,32 @@ int proc_nr_files(struct ctl_table *table, int write,
 }
 #endif
 
+static struct file *__alloc_file(const struct cred *cred)
+{
+	struct file *f;
+	int error;
+
+	f = kmem_cache_zalloc(filp_cachep, GFP_KERNEL);
+	if (unlikely(!f))
+		return ERR_PTR(-ENOMEM);
+
+	f->f_cred = get_cred(cred);
+	error = security_file_alloc(f);
+	if (unlikely(error)) {
+		file_free(f);
+		return ERR_PTR(error);
+	}
+
+	atomic_long_set(&f->f_count, 1);
+	rwlock_init(&f->f_owner.lock);
+	spin_lock_init(&f->f_lock);
+	mutex_init(&f->f_pos_lock);
+	eventpoll_init_file(f);
+	/* f->f_version: 0 */
+
+	return f;
+}
+
 /* Find an unused file structure and return a pointer to it.
  * Returns an error pointer if some error happend e.g. we over file
  * structures limit, run out of memory or operation is not permitted.
@@ -120,24 +147,10 @@ struct file *get_empty_filp(void)
 			goto over;
 	}
 
-	f = kmem_cache_zalloc(filp_cachep, GFP_KERNEL);
-	if (unlikely(!f))
-		return ERR_PTR(-ENOMEM);
+	f = __alloc_file(cred);
+	if (!IS_ERR(f))
+		percpu_counter_inc(&nr_files);
 
-	percpu_counter_inc(&nr_files);
-	f->f_cred = get_cred(cred);
-	error = security_file_alloc(f);
-	if (unlikely(error)) {
-		file_free(f);
-		return ERR_PTR(error);
-	}
-
-	atomic_long_set(&f->f_count, 1);
-	rwlock_init(&f->f_owner.lock);
-	spin_lock_init(&f->f_lock);
-	mutex_init(&f->f_pos_lock);
-	eventpoll_init_file(f);
-	/* f->f_version: 0 */
 	return f;
 
 over:
@@ -147,6 +160,23 @@ over:
 		old_max = get_nr_files();
 	}
 	return ERR_PTR(-ENFILE);
+}
+
+/*
+ * Variant of alloc_empty_file() that doesn't check and modify nr_files.
+ *
+ * Should not be used unless there's a very good reason to do so.
+ */
+struct file *alloc_empty_file_noaccount(int flags, const struct cred *cred)
+{
+	struct file *f = __alloc_file(cred);
+
+	if (!IS_ERR(f)) {
+		f->f_flags = flags;
+		f->f_mode |= FMODE_NOACCOUNT;
+	}
+
+	return f;
 }
 
 /**
