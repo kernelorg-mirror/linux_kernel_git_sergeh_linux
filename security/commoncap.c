@@ -553,6 +553,10 @@ int cap_convert_nscap(struct user_namespace *mnt_userns, struct dentry *dentry,
 		return -EINVAL;
 	if (!capable_wrt_inode_uidgid(mnt_userns, inode, CAP_SETFCAP))
 		return -EPERM;
+
+	if (!current_user_ns()->may_setfcap)
+		return -EPERM;
+
 	if (size == XATTR_CAPS_SZ_2 && (mnt_userns == &init_user_ns))
 		if (ns_capable(inode->i_sb->s_user_ns, CAP_SETFCAP))
 			/* user is privileged, just write the v2 */

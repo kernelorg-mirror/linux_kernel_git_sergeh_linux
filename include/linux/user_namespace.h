@@ -63,6 +63,14 @@ struct user_namespace {
 	kgid_t			group;
 	struct ns_common	ns;
 	unsigned long		flags;
+	/* parent_could_setfcap: true if the creator if this ns had CAP_SETFCAP
+	 * in its effective capability set at the child ns creation time. */
+	bool			parent_could_setfcap;
+
+	/* may_setfcap is false if the namespace's 0 uid is shared with an
+	 * ancestor namespace which did not have cap_setfcap when creating
+	 * its child. */
+	bool			may_setfcap;
 
 #ifdef CONFIG_KEYS
 	/* List of joinable keyrings in this namespace.  Modification access of

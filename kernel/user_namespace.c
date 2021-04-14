@@ -106,6 +106,7 @@ int create_user_ns(struct cred *new)
 	if (!ns)
 		goto fail_dec;
 
+	ns->parent_could_setfcap = cap_raised(new->cap_effective, CAP_SETFCAP);
 	ret = ns_alloc_inum(&ns->ns);
 	if (ret)
 		goto fail_free;
@@ -117,6 +118,7 @@ int create_user_ns(struct cred *new)
 	ns->level = parent_ns->level + 1;
 	ns->owner = owner;
 	ns->group = group;
+	ns->may_setfcap = true;
 	INIT_WORK(&ns->work, free_user_ns);
 	for (i = 0; i < UCOUNT_COUNTS; i++) {
 		ns->ucount_max[i] = INT_MAX;
@@ -841,6 +843,36 @@ static int sort_idmaps(struct uid_gid_map *map)
 	return 0;
 }
 
+/*
+ * We are checking for a case where the current, new, userns,
+ * shares a root kuid with an ancestor, which did not have
+ * cap_setfcap when it created its child.
+ * This means that the ancestor, when it created its child,
+ * could not create file capabilities, but now through its
+ * decendents, which it could ptrace, it could create file
+ * capabilities valid in its own namespace.
+ */
+static void check_may_setfcap(struct user_namespace *leafns)
+{
+	kuid_t leafroot = make_kuid(leafns, 0);
+	struct user_namespace *ns, *nsp = leafns;
+
+	if (!uid_valid(leafroot))
+		return;
+
+	for (ns = leafns->parent; ; nsp = ns, ns = ns->parent) {
+		kuid_t root = make_kuid(ns, 0);
+		if (uid_eq(leafroot, root)) {
+			if (!nsp->parent_could_setfcap) {
+				leafns->may_setfcap = false;
+				break;
+			}
+		}
+		if (ns == &init_user_ns)
+			break;
+	}
+}
+
 static ssize_t map_write(struct file *file, const char __user *buf,
 			 size_t count, loff_t *ppos,
 			 int cap_setid,
@@ -848,7 +880,7 @@ static ssize_t map_write(struct file *file, const char __user *buf,
 			 struct uid_gid_map *parent_map)
 {
 	struct seq_file *seq = file->private_data;
-	struct user_namespace *ns = seq->private;
+	struct user_namespace *map_ns = seq->private;
 	struct uid_gid_map new_map;
 	unsigned idx;
 	struct uid_gid_extent extent;
@@ -895,7 +927,7 @@ static ssize_t map_write(struct file *file, const char __user *buf,
 	/*
 	 * Adjusting namespace settings requires capabilities on the target.
 	 */
-	if (cap_valid(cap_setid) && !file_ns_capable(file, ns, CAP_SYS_ADMIN))
+	if (cap_valid(cap_setid) && !file_ns_capable(file, map_ns, CAP_SYS_ADMIN))
 		goto out;
 
 	/* Parse the user data */
@@ -965,7 +997,7 @@ static ssize_t map_write(struct file *file, const char __user *buf,
 
 	ret = -EPERM;
 	/* Validate the user is allowed to use user id's mapped to. */
-	if (!new_idmap_permitted(file, ns, cap_setid, &new_map))
+	if (!new_idmap_permitted(file, map_ns, cap_setid, &new_map))
 		goto out;
 
 	ret = -EPERM;
@@ -1015,6 +1047,10 @@ static ssize_t map_write(struct file *file, const char __user *buf,
 
 	*ppos = count;
 	ret = count;
+
+	if (cap_setid == CAP_SETUID)
+		check_may_setfcap(map_ns);
+
 out:
 	if (ret < 0 && new_map.nr_extents > UID_GID_MAP_MAX_BASE_EXTENTS) {
 		kfree(new_map.forward);
@@ -1086,6 +1122,7 @@ static bool new_idmap_permitted(const struct file *file,
 				struct uid_gid_map *new_map)
 {
 	const struct cred *cred = file->f_cred;
+
 	/* Don't allow mappings that would allow anything that wouldn't
 	 * be allowed without the establishment of unprivileged mappings.
 	 */
