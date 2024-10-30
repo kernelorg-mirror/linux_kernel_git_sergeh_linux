@@ -27,6 +27,9 @@
 #include <linux/mnt_idmapping.h>
 #include <uapi/linux/lsm.h>
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/capability.h>
+
 /*
  * If a non-root user executes a setuid-root binary in
  * !secure(SECURE_NOROOT) mode, then we raise capabilities.
@@ -52,7 +55,7 @@ static void warn_setuid_and_fcaps_mixed(const char *fname)
 /**
  * cap_capable - Determine whether a task has a particular effective capability
  * @cred: The credentials to use
- * @targ_ns:  The user namespace in which we need the capability
+ * @targ_ns:  The user namespace of the resource being accessed
  * @cap: The capability to check for
  * @opts: Bitmask of options defined in include/linux/security.h
  *
@@ -67,7 +70,9 @@ static void warn_setuid_and_fcaps_mixed(const char *fname)
 int cap_capable(const struct cred *cred, struct user_namespace *targ_ns,
 		int cap, unsigned int opts)
 {
-	struct user_namespace *ns = targ_ns;
+	int ret = -EPERM;
+	struct user_namespace *capable_ns = NULL,
+		*ns = targ_ns;
 
 	/* See if cred has the capability in the target user namespace
 	 * by examining the target user namespace and all of the target
@@ -75,22 +80,30 @@ int cap_capable(const struct cred *cred, struct user_namespace *targ_ns,
 	 */
 	for (;;) {
 		/* Do we have the necessary capabilities? */
-		if (ns == cred->user_ns)
-			return cap_raised(cred->cap_effective, cap) ? 0 : -EPERM;
+		if (ns == cred->user_ns) {
+			if (cap_raised(cred->cap_effective, cap)) {
+				capable_ns = ns;
+				ret = 0;
+			}
+			break;
+		}
 
 		/*
 		 * If we're already at a lower level than we're looking for,
 		 * we're done searching.
 		 */
 		if (ns->level <= cred->user_ns->level)
-			return -EPERM;
+			break;
 
 		/* 
 		 * The owner of the user namespace in the parent of the
 		 * user namespace has all caps.
 		 */
-		if ((ns->parent == cred->user_ns) && uid_eq(ns->owner, cred->euid))
-			return 0;
+		if ((ns->parent == cred->user_ns) && uid_eq(ns->owner, cred->euid)) {
+			capable_ns = ns->parent;
+			ret = 0;
+			break;
+		}
 
 		/*
 		 * If you have a capability in a parent user ns, then you have
@@ -99,7 +112,8 @@ int cap_capable(const struct cred *cred, struct user_namespace *targ_ns,
 		ns = ns->parent;
 	}
 
-	/* We never get here */
+	trace_cap_capable(cred, targ_ns, capable_ns, cap, opts, ret);
+	return ret;
 }
 
 /**
